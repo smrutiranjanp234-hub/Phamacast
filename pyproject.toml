@@ -1,23 +1,257 @@
-[build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+#!/usr/bin/env python3
+"""
+PharmaCast - pharmacy demand forecasting and reorder planning.
 
-[project]
-name = "pharmacast"
-version = "0.1.0"
-description = "Pharmacy inventory management with demand forecasting"
-requires-python = ">=3.9"
-dependencies = []
+Usage:
+    python pharmacast.py                                  # run on synthetic demo data
+    python pharmacast.py --csv sales.csv                  # columns: date, drug, units_sold
+    python pharmacast.py --horizon 21 --lead-time 5 --service-level 0.97 --output plan.csv
 
-[project.optional-dependencies]
-dev = ["pytest"]
+Requires: numpy, pandas
+"""
+from __future__ import annotations
 
-[project.scripts]
-pharmacast = "pharmacast.cli:main"
+import argparse
+import itertools
+import math
+from dataclasses import dataclass
+from statistics import NormalDist
 
-[tool.setuptools.packages.find]
-where = ["src"]
+import numpy as np
+import pandas as pd
 
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
+SEASON = 7  # weekly seasonality
+
+
+# --------------------------------------------------------------------------- #
+# Data
+# --------------------------------------------------------------------------- #
+DEMO_DRUGS = {
+    # name: (base daily demand, trend/day, annual amplitude, annual peak day, shelf life days)
+    "Paracetamol 500mg": (60, 0.01, 0.15, 20, 720),
+    "Amoxicillin 250mg": (25, 0.00, 0.20, 15, 540),
+    "Cough Syrup": (18, 0.00, 0.60, 10, 365),
+    "Metformin 500mg": (45, 0.02, 0.05, 0, 900),
+    "Cetirizine 10mg": (22, 0.00, 0.50, 100, 730),
+    "Insulin Glargine": (12, 0.005, 0.03, 0, 180),
+}
+
+
+def generate_demo_data(n_days: int = 730, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n_days)
+    weekday_factor = np.array([1.15, 1.05, 1.0, 1.0, 1.1, 0.85, 0.7])
+    rows = []
+    for drug, (base, trend, amp, peak, _) in DEMO_DRUGS.items():
+        t = np.arange(n_days)
+        annual = 1 + amp * np.cos(2 * np.pi * (dates.dayofyear.values - peak) / 365.25)
+        mean = (base + trend * t) * annual * weekday_factor[dates.dayofweek.values]
+        units = rng.poisson(np.clip(mean, 0.1, None))
+        rows.append(pd.DataFrame({"date": dates, "drug": drug, "units_sold": units}))
+    return pd.concat(rows, ignore_index=True)
+
+
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, parse_dates=["date"])
+    missing = {"date", "drug", "units_sold"} - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing columns: {sorted(missing)}")
+    return df
+
+
+def to_daily_series(df: pd.DataFrame) -> dict[str, pd.Series]:
+    """One continuous daily series per drug (missing days filled with 0)."""
+    out = {}
+    for drug, g in df.groupby("drug"):
+        s = g.groupby("date")["units_sold"].sum().sort_index()
+        s = s.reindex(pd.date_range(s.index.min(), s.index.max()), fill_value=0)
+        out[drug] = s.astype(float)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Forecasting models  (each: f(y: np.ndarray, h: int) -> np.ndarray)
+# --------------------------------------------------------------------------- #
+def naive(y: np.ndarray, h: int) -> np.ndarray:
+    return np.repeat(y[-1], h)
+
+
+def moving_average(y: np.ndarray, h: int, window: int = 28) -> np.ndarray:
+    return np.repeat(y[-window:].mean(), h)
+
+
+def seasonal_naive(y: np.ndarray, h: int) -> np.ndarray:
+    last = y[-SEASON:]
+    return np.array([last[i % SEASON] for i in range(h)])
+
+
+def simple_exp_smoothing(y: np.ndarray, h: int, alpha: float = 0.2) -> np.ndarray:
+    level = y[0]
+    for v in y[1:]:
+        level = alpha * v + (1 - alpha) * level
+    return np.repeat(level, h)
+
+
+def _hw_run(y, alpha, beta, gamma):
+    level = y[:SEASON].mean()
+    trend = (y[SEASON:2 * SEASON].mean() - y[:SEASON].mean()) / SEASON
+    seas = list(y[:SEASON] - level)
+    sse = 0.0
+    for i, v in enumerate(y[SEASON:], start=SEASON):
+        s = seas[i % SEASON]
+        pred = level + trend + s
+        sse += (v - pred) ** 2
+        new_level = alpha * (v - s) + (1 - alpha) * (level + trend)
+        trend = beta * (new_level - level) + (1 - beta) * trend
+        seas[i % SEASON] = gamma * (v - new_level) + (1 - gamma) * s
+        level = new_level
+    return level, trend, seas, sse
+
+
+def holt_winters(y: np.ndarray, h: int) -> np.ndarray:
+    """Additive Holt-Winters with weekly seasonality and a small grid search."""
+    if len(y) < 3 * SEASON:
+        return seasonal_naive(y, h)
+    y = y[-365:]  # recent history is enough, keeps it fast
+    best = None
+    for a, b, g in itertools.product((0.05, 0.15, 0.3), (0.0, 0.01), (0.1, 0.3)):
+        res = _hw_run(y, a, b, g)
+        if best is None or res[3] < best[3]:
+            best = res
+    level, trend, seas, _ = best
+    n = len(y)
+    return np.maximum(
+        np.array([level + (k + 1) * trend + seas[(n + k) % SEASON] for k in range(h)]), 0
+    )
+
+
+MODELS = {
+    "naive": naive,
+    "moving_avg_28": moving_average,
+    "seasonal_naive": seasonal_naive,
+    "exp_smoothing": simple_exp_smoothing,
+    "holt_winters": holt_winters,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Backtesting
+# --------------------------------------------------------------------------- #
+@dataclass
+class BacktestResult:
+    model: str
+    mae: float
+    rmse: float
+    residual_std: float
+
+
+def backtest(y: np.ndarray, horizon: int, folds: int = 6, min_train: int = 120) -> list[BacktestResult]:
+    """Rolling-origin evaluation. Returns results sorted by MAE."""
+    results = []
+    n = len(y)
+    origins = [n - horizon * (k + 1) for k in range(folds) if n - horizon * (k + 1) >= min_train]
+    if not origins:
+        raise ValueError("Not enough history to backtest.")
+    for name, fn in MODELS.items():
+        errs = []
+        for o in origins:
+            pred = fn(y[:o], horizon)
+            errs.extend(y[o:o + horizon] - pred)
+        errs = np.array(errs)
+        results.append(
+            BacktestResult(name, float(np.mean(np.abs(errs))),
+                           float(np.sqrt(np.mean(errs ** 2))), float(errs.std(ddof=1)))
+        )
+    return sorted(results, key=lambda r: r.mae)
+
+
+# --------------------------------------------------------------------------- #
+# Inventory planning
+# --------------------------------------------------------------------------- #
+@dataclass
+class PlanParams:
+    horizon: int = 14
+    lead_time: int = 3
+    review_period: int = 7
+    service_level: float = 0.95
+    on_hand: dict[str, float] | None = None
+    shelf_life: dict[str, int] | None = None
+
+
+def plan_reorder(drug: str, y: pd.Series, p: PlanParams) -> dict:
+    values = y.to_numpy()
+    ranking = backtest(values, p.horizon)
+    best = ranking[0]
+    forecast = MODELS[best.model](values, p.horizon + p.lead_time + p.review_period)
+
+    z = NormalDist().inv_cdf(p.service_level)
+    # daily residual std approximated from backtest; scale over protection interval
+    protection = p.lead_time + p.review_period
+    safety_stock = z * best.residual_std * math.sqrt(protection)
+    lead_demand = forecast[:p.lead_time].sum()
+    reorder_point = lead_demand + z * best.residual_std * math.sqrt(p.lead_time)
+
+    target_stock = forecast[:protection].sum() + safety_stock
+    on_hand = (p.on_hand or {}).get(drug, float(values[-7:].sum()))  # default: ~1 week of stock
+    order_qty = max(0.0, target_stock - on_hand)
+
+    # Expiry guard: never hold more than ~half the shelf life of demand
+    shelf = (p.shelf_life or {}).get(drug)
+    if shelf:
+        max_stock = values[-28:].mean() * shelf * 0.5
+        order_qty = min(order_qty, max(0.0, max_stock - on_hand))
+
+    return {
+        "drug": drug,
+        "best_model": best.model,
+        "backtest_mae": round(best.mae, 2),
+        "next_{}d_forecast".format(p.horizon): round(float(forecast[:p.horizon].sum())),
+        "avg_daily_forecast": round(float(forecast[:p.horizon].mean()), 1),
+        "safety_stock": math.ceil(safety_stock),
+        "reorder_point": math.ceil(reorder_point),
+        "on_hand": round(on_hand),
+        "order_qty": math.ceil(order_qty),
+        "action": "REORDER NOW" if on_hand <= reorder_point else "OK",
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PharmaCast - pharmacy demand forecasting")
+    ap.add_argument("--csv", help="CSV with columns: date, drug, units_sold")
+    ap.add_argument("--horizon", type=int, default=14, help="forecast horizon in days")
+    ap.add_argument("--lead-time", type=int, default=3, help="supplier lead time in days")
+    ap.add_argument("--review-period", type=int, default=7, help="days between orders")
+    ap.add_argument("--service-level", type=float, default=0.95, help="e.g. 0.95")
+    ap.add_argument("--output", help="write plan to this CSV path")
+    args = ap.parse_args()
+
+    if not 0.5 < args.service_level < 1:
+        ap.error("--service-level must be between 0.5 and 1 (exclusive)")
+
+    if args.csv:
+        df, shelf = load_csv(args.csv), None
+    else:
+        print("No CSV supplied - using synthetic demo data.\n")
+        df = generate_demo_data()
+        shelf = {k: v[4] for k, v in DEMO_DRUGS.items()}
+
+    params = PlanParams(args.horizon, args.lead_time, args.review_period,
+                        args.service_level, shelf_life=shelf)
+
+    plans = [plan_reorder(drug, s, params) for drug, s in to_daily_series(df).items()]
+    plan_df = pd.DataFrame(plans).sort_values(["action", "drug"], ascending=[False, True])
+
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_columns", None)
+    print(plan_df.to_string(index=False))
+
+    if args.output:
+        plan_df.to_csv(args.output, index=False)
+        print(f"\nSaved plan to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
